@@ -289,6 +289,19 @@
             .feature-strip { grid-template-columns: 1fr 1fr; gap: 10px 0; }
             .feature:nth-child(3) { border-left: none; }
         }
+        /* Taller boxes: fill the screen height; results list scrolls inside its panel */
+        .editor-shell .khmer-editor,
+        .editor-shell .khmer-editor:focus { height: clamp(250px, calc(100vh - 430px), 900px); }
+        .result-inner { display: flex; flex-direction: column; height: 100%; }
+        .result-body { overflow-y: auto; }
+        @media (min-width: 900px) {
+            .workspace-card { align-items: stretch; }
+            .result-pane { position: relative; min-height: 420px; }
+            .result-inner { position: absolute; inset: 0; }
+            .result-body { flex: 1; min-height: 0; }
+            .dropzone { min-height: calc(clamp(250px, calc(100vh - 430px), 900px) + 64px); }
+        }
+        @media (max-width: 899px) { .result-body { max-height: 460px; } }
         @media (max-width: 520px) {
             .feature-strip { grid-template-columns: 1fr; }
             .feature { border-left: none; }
@@ -357,16 +370,17 @@
                         <label class="dropzone" id="dropzone" for="file-input">
                             <span class="dz-icon"><i class="fa-solid fa-cloud-arrow-up"></i></span>
                             <span class="dz-title">ចុចដើម្បីជ្រើសរើសឯកសារ ឬអូសមកទីនេះ</span>
-                            <span class="dz-sub">ទំហំអតិបរមា 10 MB · អត្ថបទដំបូង 5,000 តួអក្សរនឹងត្រូវពិនិត្យ</span>
-                            <span class="dz-types"><span class="dz-chip">PDF</span><span class="dz-chip">Word (.docx)</span></span>
+                            <span class="dz-sub">ទំហំអតិបរមា 10 MB · រូបភាពនឹងត្រូវអានអត្ថបទដោយ AI (OCR) · អត្ថបទដំបូង 5,000 តួអក្សរនឹងត្រូវពិនិត្យ</span>
+                            <span class="dz-types"><span class="dz-chip">PDF</span><span class="dz-chip">Word (.docx)</span><span class="dz-chip">រូបភាព JPG / PNG</span></span>
                         </label>
-                        <input type="file" id="file-input" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+                        <input type="file" id="file-input" accept=".pdf,.docx,.jpg,.jpeg,.png,.webp,image/*,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
                         <div id="file-status" aria-live="polite"></div>
                     </div>
                 </section>
 
                 <!-- ───── RIGHT: results ───── -->
                 <aside class="result-pane">
+                <div class="result-inner">
                     <div class="result-head">
                         <i class="fa-solid fa-circle-check ok-ico"></i>
                         <h3>លទ្ធផលពិនិត្យ</h3>
@@ -383,6 +397,7 @@
                         <div id="result-list"></div>
                         <button class="view-all" id="view-all-btn" onclick="toggleAllResults()" style="display:none"></button>
                     </div>
+                </div>
                 </aside>
             </div>
 
@@ -544,7 +559,19 @@ function runSpellCheck() {
             // ② Not in dict → run syllable-based maxMatch
             //    Sub-matches found in dict → pass through
             //    Residuals not in dict → highlight as error
-            const parts = maxMatch(norm);
+            // A dictionary hit sandwiched between two unknown pieces is almost always part of the same
+            // misspelled word (e.g. កំ|ណា|ត្ដ → កំណាត្ដ). Merge so the WHOLE word is one clickable unit.
+            const raw = maxMatch(norm), parts = [];
+            for (let k = 0; k < raw.length; k++) {
+                let cur = { text: raw[k].text, error: raw[k].error };
+                if (cur.error) {
+                    while (k + 2 < raw.length && !raw[k + 1].error && raw[k + 2].error && toUnits(raw[k + 1].text).length <= 3) {
+                        cur.text += raw[k + 1].text + raw[k + 2].text;
+                        k += 2;
+                    }
+                }
+                parts.push(cur);
+            }
             for (const p of parts) {
                 lineHtml += p.error ? errSpan(p.text, norm) : p.text;
             }
@@ -594,7 +621,14 @@ editor.addEventListener('paste', function (e) {
         const w = word.normalize('NFC');
         if (variantCache.has(w)) return variantCache.get(w);
         let hit = '';
-        if ([...w].length >= 4 && !(window._SPELL_SET && window._SPELL_SET.has(w))) {
+        const WS = window._SPELL_SET;
+        if (WS && !WS.has(w)) {
+            // ឲ (U+17B2) vs ឱ (U+17B1): same sound, the wordlist decides which spelling is official (e.g. ឲ្យ → ឱ្យ)
+            for (const alt of [w.replace(/\u17B2/g, '\u17B1'), w.replace(/\u17B1/g, '\u17B2')]) {
+                if (alt !== w && WS.has(alt)) hit = alt;
+            }
+        }
+        if (!hit && [...w].length >= 4 && !(WS && WS.has(w))) {
             for (const d of KHMER_WORDLIST) {
                 const nd = d.normalize('NFC');
                 if (Math.abs(nd.length - w.length) > 1 || [...nd].length < 4) continue;
@@ -1105,6 +1139,31 @@ editor.addEventListener('paste', function (e) {
         await loadScriptOnce(MAMMOTH_SRC);
         return (await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() })).value;
     }
+    const OCR_ENDPOINT = '/.netlify/functions/ocr-khmer';
+    function fileToJpegBase64(file, maxSide = 1800) {
+        return new Promise((resolve, reject) => {
+            const url = URL.createObjectURL(file), img = new Image();
+            img.onload = () => {
+                const k = Math.min(1, maxSide / Math.max(img.width, img.height));
+                const c = document.createElement('canvas');
+                c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+                const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.drawImage(img, 0, 0, c.width, c.height);
+                URL.revokeObjectURL(url);
+                resolve(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
+            };
+            img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('bad_image')); };
+            img.src = url;
+        });
+    }
+    async function extractImageText(file) {
+        const data = await fileToJpegBase64(file);
+        const ctrl = new AbortController(), timer = setTimeout(() => ctrl.abort(), 30000);
+        try {
+            const res = await fetch(OCR_ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mime: 'image/jpeg', data }), signal: ctrl.signal });
+            if (!res.ok) { const j = await res.json().catch(() => ({})); throw new Error('OCR ' + res.status + (j.error ? ':' + j.error : '') + (j.detail ? ' ' + j.detail : '')); }
+            return String((await res.json()).text || '');
+        } finally { clearTimeout(timer); }
+    }
     function setFileStatus(html, isErr) {
         const el = document.getElementById('file-status');
         el.className = isErr ? 'err' : '';
@@ -1113,28 +1172,31 @@ editor.addEventListener('paste', function (e) {
     async function handleFile(file) {
         if (!file) return;
         const name = file.name.toLowerCase();
-        const kind = name.endsWith('.pdf') ? 'pdf' : name.endsWith('.docx') ? 'docx' : null;
+        const isImg = /\.(jpe?g|png|webp)$/.test(name) || /^image\/(jpeg|png|webp)$/.test(file.type);
+        const kind = name.endsWith('.pdf') ? 'pdf' : name.endsWith('.docx') ? 'docx' : isImg ? 'image' : null;
         if (!kind) {
+            if (/\.(heic|heif|gif|bmp|tiff?)$/.test(name)) return setFileStatus('ទ្រង់ទ្រាយរូបភាពនេះមិនគាំទ្រទេ — សូមប្រើ JPG, PNG ឬ WebP', true);
             return setFileStatus(name.endsWith('.doc')
                 ? 'ទ្រង់ទ្រាយ .doc ចាស់មិនត្រូវបានគាំទ្រទេ — សូមរក្សាទុកជា .docx ក្នុង Word ជាមុនសិន'
                 : 'គាំទ្រតែឯកសារ PDF និង Word (.docx) ប៉ុណ្ណោះ', true);
         }
         if (file.size > UPLOAD_MAX_BYTES) return setFileStatus('ឯកសារធំពេក (អតិបរមា 10 MB)', true);
 
-        setFileStatus('<i class="fa-solid fa-spinner fa-spin"></i> កំពុងអានឯកសារ ' + escHtml(file.name) + '...');
+        setFileStatus('<i class="fa-solid fa-spinner fa-spin"></i> ' + (kind === 'image' ? 'កំពុងអានអត្ថបទពីរូបភាពដោយ AI (OCR) ដែលអាចចំណាយពេលរហូតដល់ ២០ វិនាទី...' : 'កំពុងអានឯកសារ ') + (kind === 'image' ? '' : escHtml(file.name)) + '...');
         try {
-            let text = (kind === 'pdf' ? await extractPdf(file) : await extractDocx(file)).normalize('NFC');
+            let text = (kind === 'pdf' ? await extractPdf(file) : kind === 'docx' ? await extractDocx(file) : await extractImageText(file)).normalize('NFC');
             text = text.replace(/\r\n?/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
-            if (!text) return setFileStatus('រកមិនឃើញអត្ថបទក្នុងឯកសារទេ (ប្រហែលជា PDF ស្កេនជារូបភាព)', true);
+            if (!text) return setFileStatus(kind === 'image' ? 'រកមិនឃើញអត្ថបទក្នុងរូបភាពទេ' : 'រកមិនឃើញអត្ថបទក្នុងឯកសារទេ (ប្រហែលជា PDF ស្កេនជារូបភាព — សូមផ្ទុកឡើងជារូបភាព JPG/PNG វិញ)', true);
             const truncated = [...text].length > MAX_CHARS;
             setEditorText(limitText(text, MAX_CHARS));
             setFileStatus('');
             switchMode('text');
             runFullCheck();
+            if (kind === 'image') setNotice('អត្ថបទនេះអានពីរូបភាពដោយ AI — សូមប្រៀបធៀបនឹងរូបភាពដើម ព្រោះការអានអាចមានកំហុស');
             if (truncated) setNotice('ឯកសារវែងជាង 5,000 តួអក្សរ — បានពិនិត្យតែ 5,000 តួអក្សរដំបូងប៉ុណ្ណោះ');
         } catch (err) {
             console.error(err);
-            setFileStatus('មិនអាចអានឯកសារនេះបានទេ — សូមព្យាយាមម្ដងទៀត ឬប្រើឯកសារផ្សេង', true);
+            setFileStatus('មិនអាចអានឯកសារនេះបានទេ — សូមព្យាយាមម្ដងទៀត ឬប្រើឯកសារផ្សេង' + (kind === 'image' ? ' [' + escHtml(String(err.message).slice(0, 80)) + ']' : ''), true);
         }
     }
     (function initUpload() {
