@@ -587,7 +587,31 @@ editor.addEventListener('paste', function (e) {
         return dp[m][n];
     }
 
+    /** Wordlist is the authority: an unknown word that differs by exactly ONE character from a wordlist word
+        (e.g. អាមេរិក vs អាម៉េរិក) is treated as a misspelling of that wordlist word — AI is not consulted for it. */
+    const variantCache = new Map();
+    function officialVariant(word) {
+        const w = word.normalize('NFC');
+        if (variantCache.has(w)) return variantCache.get(w);
+        let hit = '';
+        if ([...w].length >= 4 && !(window._SPELL_SET && window._SPELL_SET.has(w))) {
+            for (const d of KHMER_WORDLIST) {
+                const nd = d.normalize('NFC');
+                if (Math.abs(nd.length - w.length) > 1 || [...nd].length < 4) continue;
+                if (levenshtein(w, nd) === 1) { hit = nd; break; }
+            }
+        }
+        variantCache.set(w, hit);
+        return hit;
+    }
+
     function getLevenshteinSuggestions(word) {
+        const nw = word.normalize("NFC");
+        const v = officialVariant(nw);
+        const list = getLevenshteinRaw(word);
+        return v ? [...new Set([v, ...list])].slice(0, 5) : list;
+    }
+    function getLevenshteinRaw(word) {
         const nw = word.normalize("NFC");
         return KHMER_WORDLIST
             .map(w => ({ word: w, dist: levenshtein(nw, w.normalize("NFC")) }))
@@ -710,6 +734,7 @@ editor.addEventListener('paste', function (e) {
             const word = span.textContent.normalize('NFC').trim();
             if (!word || seen.has(word)) continue;
             seen.add(word);
+            if (officialVariant(word)) continue;   // wordlist already decided: misspelling of an official word
             const context = (sideText(span.previousSibling, -1) + word + sideText(span.nextSibling, 1)).trim();
             items.push({ word, token: [...(span.dataset.tok || word)].slice(0, 120).join(''), context: [...context].slice(0, AI_MAX_CONTEXT).join('') });
             if (items.length >= AI_MAX_WORDS) break;
