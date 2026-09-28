@@ -2,7 +2,11 @@
 // Secure Gemini proxy for the Khmer Spell Checker (2nd layer after the wordlist).
 // The API key is read ONLY from the Netlify env var GEMINI_API_KEY and never reaches the browser.
 
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+// gemini-2.5-* is being retired (Oct 2026) — default to Gemini 3.x, with fallbacks if a model id is not found (404).
+// Set GEMINI_MODEL in Netlify to force one specific model.
+const MODELS = process.env.GEMINI_MODEL
+  ? [process.env.GEMINI_MODEL]
+  : ['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-3.5-flash-lite'];
 const GEMINI_TIMEOUT_MS = 8000;
 const MAX_BODY_BYTES = 32 * 1024;
 const MAX_ITEMS = 20;
@@ -114,34 +118,41 @@ exports.handler = async (event) => {
   const items = parseItems(rawBody);
   if (!items) return reply(400, { error: 'bad_request' });
 
-  const generationConfig = {
-    temperature: 0.1,
-    maxOutputTokens: 2048,
-    responseMimeType: 'application/json',
-    responseSchema: RESPONSE_SCHEMA,
+  const configFor = (model) => {
+    const cfg = { maxOutputTokens: 2048, responseMimeType: 'application/json', responseSchema: RESPONSE_SCHEMA };
+    if (/gemini-3/.test(model)) cfg.thinkingConfig = { thinkingLevel: 'MINIMAL' };            // Gemini 3.x: no temperature / thinkingBudget
+    else { cfg.temperature = 0.1; if (/2\.5-flash/.test(model)) cfg.thinkingConfig = { thinkingBudget: 0 }; }
+    return cfg;
   };
-  if (/2\.5-flash/.test(MODEL)) generationConfig.thinkingConfig = { thinkingBudget: 0 }; // faster, cheaper
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), GEMINI_TIMEOUT_MS);
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(MODEL)}:generateContent`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [{ role: 'user', parts: [{ text: JSON.stringify({ items }) }] }],
-          generationConfig,
-        }),
-        signal: ctrl.signal,
-      }
-    );
+    let res, lastErr = '';
+    for (const model of MODELS) {
+      res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            contents: [{ role: 'user', parts: [{ text: JSON.stringify({ items }) }] }],
+            generationConfig: configFor(model),
+          }),
+          signal: ctrl.signal,
+        }
+      );
+      if (res.ok) break;
+      const errText = await res.text();
+      console.error('Gemini HTTP', res.status, model, errText.slice(0, 400));
+      let g = {}; try { g = JSON.parse(errText).error || {}; } catch {}
+      lastErr = `${res.status}${g.status ? ' ' + g.status : ''} ${model}`;
+      if (res.status !== 404) break;   // only try the next model when this model id does not exist
+    }
 
     if (!res.ok) {
-      console.error('Gemini HTTP', res.status, (await res.text()).slice(0, 300));
-      return reply(res.status === 429 ? 429 : 502, { error: res.status === 429 ? 'rate_limited' : 'upstream_error' });
+      return reply(res.status === 429 ? 429 : 502, { error: res.status === 429 ? 'rate_limited' : 'upstream_error', detail: lastErr });
     }
 
     const data = await res.json();
