@@ -771,7 +771,7 @@ editor.addEventListener('paste', function (e) {
                 });
                 if (!res.ok) {
                     const j = await res.json().catch(() => ({}));
-                    throw new Error(res.status + (j && j.error ? ':' + j.error : ''));
+                    throw new Error(res.status + (j && j.error ? ':' + j.error : '') + (j && j.detail ? ' ' + j.detail : ''));
                 }
                 return { batch, data: await res.json() };
             }));
@@ -806,7 +806,7 @@ editor.addEventListener('paste', function (e) {
         if (failure && failure.name !== 'AbortError') {
             console.error('AI layer failed:', failure);
             const el = document.getElementById('ai-status');
-            if (el) el.insertAdjacentText('beforeend', ' [' + String(failure.message).slice(0, 40) + ']');
+            if (el) el.insertAdjacentText('beforeend', ' [' + String(failure.message).slice(0, 80) + ']');
         }
         refreshOpenSheet();
     }
