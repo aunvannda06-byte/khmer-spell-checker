@@ -21,6 +21,7 @@ Rules:
 - "word": copy exactly as given.
 - KHMER: the dictionary often splits long or compound Khmer words, so "word" may be only a fragment of a correctly spelled longer word (for example a fragment inside "សហប្រតិបត្តិការ"). Judge the whole "token" in its sentence. If the token or compound is correct, return type "valid" with an empty suggestions array.
 - ENGLISH: check the English spelling. Correct English words, acronyms (e.g. CDC, UN), proper nouns, brand names, numbers and codes are "valid". Misspelled English words are "spelling" with corrected English suggestions.
+- The "word" may also be a WHOLE misspelled word whose pieces the dictionary partly matched (e.g. a typo of កំណាត់). In that case suggest the full corrected word, not a fragment.
 - "suggestions": up to 5 replacement spellings for the flagged word ONLY (not the whole sentence), best first. Use an empty array if the word is already correct or you cannot tell.
 - "type": "spelling" (misspelled), "grammar" (wrong form or usage), "context" (a real word but wrong for this sentence), or "valid" (actually correct, e.g. a name, loanword, acronym, new word, or a correct part of a longer word).
 - "reason": one short sentence in Khmer, at most 100 characters.
