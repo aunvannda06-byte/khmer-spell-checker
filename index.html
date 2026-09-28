@@ -51,7 +51,7 @@
         main {
             flex: 1;
             overflow-y: auto;
-            padding: 20px;
+            padding: 14px 12px;
             padding-bottom: 30px;
             scrollbar-width: none;
         }
@@ -160,7 +160,7 @@
         }
         .suggestion-item:active { background: var(--primary-light); }
         /* ══ Workspace layout (input card + results panel) ══ */
-        .workspace { max-width: 1180px; margin: 0 auto; }
+        .workspace { max-width: 1900px; width: 100%; margin: 0 auto; }
         .workspace-card {
             background: #fff; border-radius: 24px; padding: 18px;
             box-shadow: var(--shadow); border: 1px solid #e8eef8;
@@ -462,9 +462,9 @@ function runSpellCheck() {
         return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
                 .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
-    function errSpan(s) {
+    function errSpan(s, tok) {
         const e = esc(s);
-        return `<span class="misspelled" ontouchstart="handleMisspelledTouch(event,this,'${e}')" onclick="handleMisspelledTouch(event,this,'${e}')">${s}</span>`;
+        return `<span class="misspelled" data-tok="${esc(tok || s)}" ontouchstart="handleMisspelledTouch(event,this,'${e}')" onclick="handleMisspelledTouch(event,this,'${e}')">${s}</span>`;
     }
 
     // ── maxMatch using syllable units ─────────────────────────────
@@ -546,7 +546,7 @@ function runSpellCheck() {
             //    Residuals not in dict → highlight as error
             const parts = maxMatch(norm);
             for (const p of parts) {
-                lineHtml += p.error ? errSpan(p.text) : p.text;
+                lineHtml += p.error ? errSpan(p.text, norm) : p.text;
             }
         }
 
@@ -658,7 +658,8 @@ editor.addEventListener('paste', function (e) {
        ══════════════════════════════════════════════════════════════ */
     const AI_ENDPOINT = '/.netlify/functions/check-khmer';
     const AI_TIMEOUT_MS = 10000;   // frontend gives up (server itself stops at 8s)
-    const AI_MAX_WORDS = 15;       // cap words per request to limit API usage
+    const AI_MAX_WORDS = 60;       // cap words per check (sent in batches)
+    const AI_BATCH = 10;           // words per request
     const AI_MAX_CONTEXT = 300;
     const AI_TYPE_LABEL = { spelling: 'អក្ខរាវិរុទ្ធ', grammar: 'វេយ្យាករណ៍', context: 'បរិបទ', valid: 'ប្រហែលជាត្រឹមត្រូវ' };
     const AI_STATUS_TEXT = {
@@ -710,10 +711,24 @@ editor.addEventListener('paste', function (e) {
             if (!word || seen.has(word)) continue;
             seen.add(word);
             const context = (sideText(span.previousSibling, -1) + word + sideText(span.nextSibling, 1)).trim();
-            items.push({ word, context: [...context].slice(0, AI_MAX_CONTEXT).join('') });
+            items.push({ word, token: [...(span.dataset.tok || word)].slice(0, 120).join(''), context: [...context].slice(0, AI_MAX_CONTEXT).join('') });
             if (items.length >= AI_MAX_WORDS) break;
         }
         return items;
+    }
+
+    /** AI confirmed the word is correct (real Khmer word split by the wordlist, English word, acronym, name…) → remove the red highlight. */
+    function unwrapValidSpans() {
+        const ed = document.getElementById('spell-editor');
+        let changed = false;
+        for (const span of ed.querySelectorAll('.misspelled')) {
+            const r = AI.results.get(span.textContent.normalize('NFC').trim());
+            if (!r || r.type !== 'valid') continue;
+            if (span === selectedMisspelledNode) { selectedMisspelledNode = null; closeSheet(); }
+            span.replaceWith(document.createTextNode(span.textContent));
+            changed = true;
+        }
+        if (changed) ed.normalize();
     }
 
     function refreshOpenSheet() {
@@ -737,7 +752,7 @@ editor.addEventListener('paste', function (e) {
             const hit = AI.cache.get(it.word + '\u0001' + it.context);
             if (hit) AI.results.set(it.word, hit); else toFetch.push(it);
         }
-        if (!toFetch.length) { AI.state = 'done'; setAiStatus(''); return; }
+        if (!toFetch.length) { AI.state = 'done'; setAiStatus(''); unwrapValidSpans(); return; }
 
         AI.state = 'loading';
         setAiStatus('loading');
@@ -745,28 +760,36 @@ editor.addEventListener('paste', function (e) {
         const timer = setTimeout(() => ctrl.abort(), AI_TIMEOUT_MS);
         let failure = null;
         try {
-            const res = await fetch(AI_ENDPOINT, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ items: toFetch }),
-                signal: ctrl.signal
-            });
-            if (!res.ok) throw new Error('http_' + res.status);
-            const data = await res.json();
+            const batches = [];
+            for (let i = 0; i < toFetch.length; i += AI_BATCH) batches.push(toFetch.slice(i, i + AI_BATCH));
+            const settled = await Promise.allSettled(batches.map(async batch => {
+                const res = await fetch(AI_ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items: batch }),
+                    signal: ctrl.signal
+                });
+                if (!res.ok) throw new Error('http_' + res.status);
+                return { batch, data: await res.json() };
+            }));
             if (runId !== AI.runId) return;
-            for (const r of Array.isArray(data.results) ? data.results : []) {
-                if (!r || typeof r.word !== 'string') continue;
-                const item = toFetch.find(i => i.word === r.word);
-                if (!item) continue;
-                const result = {
-                    word: r.word,
-                    suggestions: (Array.isArray(r.suggestions) ? r.suggestions : []).filter(s => typeof s === 'string' && s).slice(0, 5),
-                    type: AI_TYPE_LABEL[r.type] ? r.type : 'spelling',
-                    reason: typeof r.reason === 'string' ? r.reason : ''
-                };
-                AI.results.set(r.word, result);
-                AI.cache.set(item.word + '\u0001' + item.context, result);
-                if (AI.cache.size > 200) AI.cache.delete(AI.cache.keys().next().value);
+            const okBatches = settled.filter(x => x.status === 'fulfilled').map(x => x.value);
+            if (!okBatches.length) throw settled[0].reason;   // every batch failed → fall back to wordlist only
+            for (const { batch, data } of okBatches) {
+                for (const r of Array.isArray(data.results) ? data.results : []) {
+                    if (!r || typeof r.word !== 'string') continue;
+                    const item = batch.find(i => i.word === r.word);
+                    if (!item) continue;
+                    const result = {
+                        word: r.word,
+                        suggestions: (Array.isArray(r.suggestions) ? r.suggestions : []).filter(s => typeof s === 'string' && s).slice(0, 5),
+                        type: AI_TYPE_LABEL[r.type] ? r.type : 'spelling',
+                        reason: typeof r.reason === 'string' ? r.reason : ''
+                    };
+                    AI.results.set(r.word, result);
+                    AI.cache.set(item.word + '\u0001' + item.context, result);
+                    if (AI.cache.size > 200) AI.cache.delete(AI.cache.keys().next().value);
+                }
             }
         } catch (err) {
             failure = err;
@@ -775,6 +798,7 @@ editor.addEventListener('paste', function (e) {
         }
         if (runId !== AI.runId) return;          // superseded by a newer check / clear
         AI.state = failure ? 'error' : 'done';
+        if (!failure) unwrapValidSpans();
         setAiStatus(failure ? (failure.name === 'AbortError' ? 'timeout' : 'error') : '');
         refreshOpenSheet();
     }
